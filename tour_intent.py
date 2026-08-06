@@ -10,6 +10,7 @@ from tour_state import fetch_id_exists, get_customer_context
 import chromadb
 from chromadb.utils.embedding_functions import ChromaLangchainEmbeddingFunction
 from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
+from tour_bot import llm
 
 nvidia_embeddings = NVIDIAEmbeddings(model="nvidia/llama-nemotron-embed-1b-v2")
 chroma_ef = ChromaLangchainEmbeddingFunction(nvidia_embeddings)
@@ -28,6 +29,46 @@ class GraphState(TypedDict):
     chat_id: str
     eval_result: str
     has_policy_intent: bool
+    hallucinated_price: bool
+    hallucinated_query: bool
+
+
+    base_system_prompt = """
+    You are a specialist in handling edge cases. Your job is to handle failed evaluated replies based on which kind it is.
+
+    You must NOT state a price without calling 
+    get_tour_pricing, must NOT state a policy without calling 
+    get_tour_policy.
+
+    If you still cannot get an answer, say so honestly, do NOT guess.
+    """
+
+    hallucinated_price_prompt = """
+
+    This is a price hallucination failure. Get the correct price from the tool again.
+    """
+
+    hallucinated_query_prompt = """
+
+    This is a query hallucination failure. Get the correct policy again.
+    """
+
+def reply_specialist_handoff(state: GraphState) -> dict:
+    org_customer_msg = state["message"]
+    hallucinated_price = state["hallucinated_price"]
+    hallucinated_query = state["hallucinated_query"]
+    hallucinated_price_prompt = hallucinated_price_prompt
+    hallucinated_query_prompt = hallucinated_query_prompt
+   
+    if hallucinated_price:
+        base_system_prompt += hallucinated_price_prompt
+    if hallucinated_query:
+        base_system_prompt += hallucinated_query_prompt
+
+    agent = create_agent
+
+
+
 
 def extract_intent(state: GraphState) -> dict:
     context = ""
@@ -51,7 +92,8 @@ def evaluate_reply(state: GraphState) -> dict:
     reply = state["reply"]
     tools_called = state["tools_called"]
     has_policy_intent = state["has_policy_intent"]
-    high_distance = False   
+    high_distance = False 
+
     if has_policy_intent:
         client = chromadb.PersistentClient(path="./chroma_policies")
         collection = client.get_or_create_collection(name="tour_policies")
@@ -69,7 +111,9 @@ def evaluate_reply(state: GraphState) -> dict:
     hallucinated_price = has_price_pattern and not tools_called
     hallucinated_query = high_distance and not tools_called
 
-    if hallucinated_price or hallucinated_query:
+    if hallucinated_price:
+        return {"eval_result": "fail"}
+    elif hallucinated_query:
         return {"eval_result": "fail"}
     return {"eval_result": "pass"}
 
