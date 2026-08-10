@@ -10,7 +10,8 @@ from tour_state import fetch_id_exists, get_customer_context
 import chromadb
 from chromadb.utils.embedding_functions import ChromaLangchainEmbeddingFunction
 from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
-from tour_bot import llm
+from tour_bot import llm, get_tour_policy, get_tour_pricing
+from langchain.agents import create_agent
 
 nvidia_embeddings = NVIDIAEmbeddings(model="nvidia/llama-nemotron-embed-1b-v2")
 chroma_ef = ChromaLangchainEmbeddingFunction(nvidia_embeddings)
@@ -33,7 +34,7 @@ class GraphState(TypedDict):
     hallucinated_query: bool
 
 
-    base_system_prompt = """
+base_system_prompt = """
     You are a specialist in handling edge cases. Your job is to handle failed evaluated replies based on which kind it is.
 
     You must NOT state a price without calling 
@@ -43,12 +44,12 @@ class GraphState(TypedDict):
     If you still cannot get an answer, say so honestly, do NOT guess.
     """
 
-    hallucinated_price_prompt = """
+hallucinated_price_prompt = """
 
     This is a price hallucination failure. Get the correct price from the tool again.
     """
 
-    hallucinated_query_prompt = """
+hallucinated_query_prompt = """
 
     This is a query hallucination failure. Get the correct policy again.
     """
@@ -57,15 +58,22 @@ def reply_specialist_handoff(state: GraphState) -> dict:
     org_customer_msg = state["message"]
     hallucinated_price = state["hallucinated_price"]
     hallucinated_query = state["hallucinated_query"]
-    hallucinated_price_prompt = hallucinated_price_prompt
-    hallucinated_query_prompt = hallucinated_query_prompt
-   
-    if hallucinated_price:
-        base_system_prompt += hallucinated_price_prompt
-    if hallucinated_query:
-        base_system_prompt += hallucinated_query_prompt
 
-    agent = create_agent
+    full_prompt = base_system_prompt
+    if hallucinated_price:
+        full_prompt += hallucinated_price_prompt
+    if hallucinated_query:
+        full_prompt += hallucinated_query_prompt
+    history = [("user", org_customer_msg)]
+    agent = create_agent(
+        model=llm,
+        tools=[get_tour_pricing, get_tour_policy],
+        system_prompt=full_prompt
+    )
+
+    response = agent.invoke({"messages": history})
+    agent_reply = response["messages"][-1].content
+    return {"reply":agent_reply}
 
 
 
@@ -111,11 +119,17 @@ def evaluate_reply(state: GraphState) -> dict:
     hallucinated_price = has_price_pattern and not tools_called
     hallucinated_query = high_distance and not tools_called
 
-    if hallucinated_price:
-        return {"eval_result": "fail"}
-    elif hallucinated_query:
-        return {"eval_result": "fail"}
-    return {"eval_result": "pass"}
+    if hallucinated_price or hallucinated_query:
+        return {
+            "eval_result": "fail",
+            "hallucinated_price": hallucinated_price,
+            "hallucinated_query": hallucinated_query
+        }
+    return {
+        "eval_result": "pass",
+        "hallucinated_price": False,
+        "hallucinated_query": False
+        }
 
 def route_by_eval(state: GraphState) -> str:
     return state["eval_result"]
@@ -141,7 +155,7 @@ def route_by_scope(state: GraphState) -> str:
 
 graph = StateGraph(GraphState)
 graph.add_node("extract_intent", extract_intent)
-graph.add_node("reply_handoff_to_human", reply_handoff_to_human)
+graph.add_node("reply_specialist_handoff", reply_specialist_handoff)
 graph.add_node("reply_in_scope", reply_in_scope)
 graph.add_node("reply_out_of_scope", reply_out_of_scope)
 graph.add_node("reply_no_destination", reply_no_destination)
@@ -163,13 +177,13 @@ graph.add_conditional_edges(
     "evaluate_reply",
     route_by_eval,
     {   "pass": END,
-        "fail": "reply_handoff_to_human"
+        "fail": "reply_specialist_handoff"
     }
 )
 graph.add_edge("reply_out_of_scope", END)
 graph.add_edge("reply_no_destination", END)
 graph.add_edge("reply_ambiguous", END)
-graph.add_edge("reply_handoff_to_human", END)
+graph.add_edge("reply_specialist_handoff", END)
 
 msg = graph.compile()
 
